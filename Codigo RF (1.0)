@@ -1,0 +1,62 @@
+import pandas as pd, numpy as np
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+
+# === 1) Ler dados ===
+dados = pd.read_csv(
+    r"C:\Users\filip\OneDrive\Área de Trabalho\ler_nasa\dados_organizados.csv",
+    parse_dates=["DATETIME"]
+).set_index("DATETIME").sort_index()
+
+dados[["ALLSKY_SFC_SW_DWN","T2M","RH2M","WS10M"]] = \
+    dados[["ALLSKY_SFC_SW_DWN","T2M","RH2M","WS10M"]].replace(-999, np.nan)
+
+# === 2) Base de trabalho ===
+base = pd.DataFrame({
+    "hora": dados.index.hour,
+    "dia_ano": dados.index.dayofyear,
+    "Temperatura": dados["T2M"],
+    "Umidade": dados["RH2M"],
+    "Vento": dados["WS10M"],
+    "Radiacao": dados["ALLSKY_SFC_SW_DWN"]
+}).dropna()
+
+# === 3) Função de avaliação ===
+def avaliar(nome, entradas):
+    X = base[entradas]
+    y = base["Radiacao"]
+
+    corte = int(len(X)*0.8)
+    Xtr, Xte = X.iloc[:corte], X.iloc[corte:]
+    ytr, yte = y.iloc[:corte], y.iloc[corte:]
+
+    rf = RandomForestRegressor(n_estimators=300, random_state=42, n_jobs=-1)
+    rf.fit(Xtr, ytr)
+    pred = rf.predict(Xte)
+
+    rmse = np.sqrt(mean_squared_error(yte, pred))
+    mae  = mean_absolute_error(yte, pred)
+    r2   = r2_score(yte, pred)
+
+    imp = pd.Series(rf.feature_importances_, index=entradas).sort_values(ascending=False)
+
+    return {
+        "Cenario": nome,
+        "RMSE": round(rmse, 2),
+        "MAE": round(mae, 2),
+        "R2": round(r2, 3),
+        "Importancias": ", ".join([f"{k}={v:.2f}" for k,v in imp.items()])
+    }
+
+# === 4) Cenários analisados ===
+resultados = [
+    avaliar("Temperatura", ["hora","dia_ano","Temperatura"]),
+    avaliar("Umidade", ["hora","dia_ano","Umidade"]),
+    avaliar("Vento", ["hora","dia_ano","Vento"]),
+]
+
+# === 5) Tabela final ===
+tabela = pd.DataFrame(resultados).sort_values("RMSE")
+
+print("\nANÁLISE INDIVIDUAL DAS VARIÁVEIS CLIMÁTICAS (Random Forest)\n")
+print(tabela.to_string(index=False))
