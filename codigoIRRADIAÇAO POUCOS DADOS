@@ -1,0 +1,713 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.neural_network import MLPRegressor
+from sklearn.preprocessing import MinMaxScaler, StandardScaler
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+
+import tensorflow as tf
+
+
+# =========================
+# CONFIGURAÇÕES
+# =========================
+
+ARQ = r"C:\Users\filip\OneDrive\Área de Trabalho\ler_nasa\dados_organizados.csv"
+
+ENTRADAS = [
+    "hora_sin",
+    "hora_cos",
+    "dia_sin",
+    "dia_cos",
+    "umid",
+    "temp",
+    "vento",
+    "eh_dia",
+]
+
+ENTRADAS_LSTM = ENTRADAS
+
+JANELA = 3
+FRAC_TREINO_TESTE = 0.8
+FRAC_TREINO_VALIDACAO = 0.8
+
+
+# =========================
+# FUNÇÕES DE MÉTRICAS
+# =========================
+
+def metricas(y_true, y_pred):
+    mse = mean_squared_error(y_true, y_pred)
+    rmse = np.sqrt(mse)
+    mae = mean_absolute_error(y_true, y_pred)
+    r2 = r2_score(y_true, y_pred)
+    return rmse, mae, r2
+
+
+def imprimir(nome, y_true, y_pred):
+    rmse, mae, r2 = metricas(y_true, y_pred)
+    print(f"{nome:22s} | RMSE={rmse:8.2f} | MAE={mae:7.2f} | R²={r2:7.3f}")
+
+
+def avaliar_serie(nome, y_real, pred):
+    """
+    Avalia uma previsão usando apenas o índice temporal comum
+    entre y_real e pred.
+    """
+
+    if not isinstance(pred, pd.Series):
+        raise TypeError("pred precisa ser uma pd.Series com índice temporal.")
+
+    idx = y_real.index.intersection(pred.index)
+
+    if len(idx) == 0:
+        print(f"{nome:22s} | Sem índice comum para avaliação.")
+        return None
+
+    imprimir(nome, y_real.loc[idx], pred.loc[idx])
+
+    return idx
+
+
+# =========================
+# FUNÇÕES AUXILIARES
+# =========================
+
+def split_temporal(df, frac):
+    corte = int(len(df) * frac)
+    return df.iloc[:corte], df.iloc[corte:]
+
+
+def aplicar_zero_noite(pred, horas):
+    pred = np.array(pred).copy()
+
+    # Zera noite e horários de transição mais problemáticos
+    mask_noite = (horas <= 6) | (horas >= 18)
+    pred[mask_noite] = 0
+
+    # Remove valores negativos
+    pred = np.clip(pred, 0, None)
+
+    return pred
+
+
+def criar_janelas(X_df, y_ser, janela):
+    Xv = X_df.values
+    yv = y_ser.values
+
+    Xseq, yseq = [], []
+
+    for i in range(janela, len(Xv)):
+        Xseq.append(Xv[i - janela:i])
+        yseq.append(yv[i])
+
+    return np.array(Xseq), np.array(yseq)
+
+
+def adicionar_lags_rad(base, lags=(1, 2, 3)):
+    base_lag = base.copy()
+
+    for lag in lags:
+        base_lag[f"rad_lag{lag}"] = base_lag["rad"].shift(lag)
+
+    return base_lag.dropna()
+
+
+def heatmap_corr(base):
+    corr = base[["rad", "temp", "umid", "vento"]].dropna().corr(numeric_only=True)
+
+    plt.figure(figsize=(6, 5))
+    im = plt.imshow(corr.values, vmin=-1, vmax=1, cmap="coolwarm")
+    plt.colorbar(im)
+
+    plt.xticks(range(len(corr.columns)), corr.columns, rotation=45, ha="right")
+    plt.yticks(range(len(corr.index)), corr.index)
+    plt.title("Correlação (rad, temp, umid, vento)")
+
+    for i in range(corr.shape[0]):
+        for j in range(corr.shape[1]):
+            v = corr.iloc[i, j]
+            plt.text(
+                j,
+                i,
+                f"{v:.2f}",
+                ha="center",
+                va="center",
+                color="white" if abs(v) > 0.5 else "black"
+            )
+
+    plt.tight_layout()
+
+
+# =========================
+# MODELOS
+# =========================
+
+def prever_rf(Xtr, ytr, X):
+    modelo = RandomForestRegressor(
+        n_estimators=300,
+        random_state=42,
+        n_jobs=-1
+    )
+
+    modelo.fit(Xtr, ytr)
+    pred = modelo.predict(X)
+
+    return pred
+
+
+def prever_mlp_calibrado(Xtr, ytr, X, clip_zero=True):
+    sx = StandardScaler()
+    Xtr_s = sx.fit_transform(Xtr)
+    X_s = sx.transform(X)
+
+    sy = MinMaxScaler()
+    ytr_s = sy.fit_transform(ytr.values.reshape(-1, 1)).ravel()
+
+    mlp = MLPRegressor(
+        hidden_layer_sizes=(8,),
+        activation="relu",
+        solver="adam",
+        alpha=0.01,
+        batch_size=4,
+        learning_rate_init=0.001,
+        max_iter=3000,
+        early_stopping=True,
+        validation_fraction=0.2,
+        n_iter_no_change=20,
+        random_state=42
+    )
+
+    mlp.fit(Xtr_s, ytr_s)
+
+    pred_s = mlp.predict(X_s)
+
+    pred = sy.inverse_transform(
+        pred_s.reshape(-1, 1)
+    ).ravel()
+
+    if clip_zero:
+        pred = np.clip(pred, 0, None)
+
+    return pred
+
+
+def prever_lstm(Xtr, ytr, Xpred, janela, epochs=50):
+    tf.random.set_seed(42)
+    np.random.seed(42)
+
+    sx = MinMaxScaler()
+    sy = MinMaxScaler()
+
+    Xtr_s = pd.DataFrame(
+        sx.fit_transform(Xtr),
+        index=Xtr.index,
+        columns=Xtr.columns
+    )
+
+    ytr_s = pd.Series(
+        sy.fit_transform(ytr.values.reshape(-1, 1)).ravel(),
+        index=ytr.index
+    )
+
+    Xtr_seq, ytr_seq = criar_janelas(Xtr_s, ytr_s, janela)
+
+    if len(Xtr_seq) == 0:
+        raise ValueError("Treino insuficiente para criar janelas da LSTM.")
+
+    model = tf.keras.Sequential([
+        tf.keras.layers.Input(shape=(janela, Xtr_seq.shape[2])),
+        tf.keras.layers.LSTM(64, activation="tanh", return_sequences=True),
+        tf.keras.layers.Dropout(0.2),
+        tf.keras.layers.LSTM(64, activation="tanh", return_sequences=False),
+        tf.keras.layers.Dense(1)
+    ])
+
+    model.compile(
+        optimizer=tf.keras.optimizers.Adam(learning_rate=0.001),
+        loss="mse"
+    )
+
+    es = tf.keras.callbacks.EarlyStopping(
+        monitor="val_loss",
+        patience=8,
+        restore_best_weights=True
+    )
+
+    model.fit(
+        Xtr_seq,
+        ytr_seq,
+        epochs=epochs,
+        batch_size=32,
+        verbose=0,
+        validation_split=0.1,
+        callbacks=[es]
+    )
+
+    # Junta o fim do treino com o período de previsão.
+    # Isso permite gerar a primeira janela do teste usando o contexto final do treino.
+    X_contexto = pd.concat([
+        Xtr.iloc[-janela:],
+        Xpred
+    ])
+
+    X_contexto_s = pd.DataFrame(
+        sx.transform(X_contexto),
+        index=X_contexto.index,
+        columns=X_contexto.columns
+    )
+
+    Xseq_pred, _ = criar_janelas(
+        X_contexto_s,
+        pd.Series(np.zeros(len(X_contexto_s)), index=X_contexto_s.index),
+        janela
+    )
+
+    pred_s = model.predict(Xseq_pred, verbose=0).ravel()
+    pred = sy.inverse_transform(pred_s.reshape(-1, 1)).ravel()
+    pred = np.clip(pred, 0, None)
+
+    return pd.Series(pred, index=Xpred.index)
+
+
+def encontrar_melhor_peso_hibrido(y_real, pred_lstm, pred_mlp):
+    """
+    Procura o melhor peso da LSTM no híbrido:
+
+        pred_hibrido = w * LSTM + (1 - w) * MLP
+
+    A busca é feita pelo menor RMSE na validação.
+    """
+
+    idx = y_real.index.intersection(pred_lstm.index).intersection(pred_mlp.index)
+
+    if len(idx) == 0:
+        raise ValueError("Não há índice comum entre y_real, LSTM e MLP na validação.")
+
+    y = y_real.loc[idx]
+    lstm = pred_lstm.loc[idx]
+    mlp = pred_mlp.loc[idx]
+
+    best_rmse = np.inf
+    best_w = None
+    best_mae = None
+    best_r2 = None
+
+    for w in np.linspace(0, 1, 21):
+        pred_h = w * lstm + (1 - w) * mlp
+
+        rmse, mae, r2 = metricas(y, pred_h)
+
+        if rmse < best_rmse:
+            best_rmse = rmse
+            best_mae = mae
+            best_r2 = r2
+            best_w = w
+
+    return best_w, best_rmse, best_mae, best_r2
+
+
+# =========================
+# LEITURA E PREPARAÇÃO DOS DADOS
+# =========================
+
+dados = (
+    pd.read_csv(ARQ, parse_dates=["DATETIME"])
+    .set_index("DATETIME")
+    .sort_index()
+    .replace(-999, np.nan)
+    .rename(columns={
+        "ALLSKY_SFC_SW_DWN": "rad",
+        "T2M": "temp",
+        "RH2M": "umid",
+        "WS10M": "vento"
+    })
+)
+
+dados = dados.resample("1h").asfreq()
+
+dados[["temp", "umid", "vento"]] = dados[["temp", "umid", "vento"]].interpolate(
+    "linear",
+    limit=6
+)
+
+dados = dados.dropna(subset=["rad"])
+
+dados["hora"] = dados.index.hour
+dados["dia_ano"] = dados.index.dayofyear
+
+dados["hora_sin"] = np.sin(2 * np.pi * dados["hora"] / 24)
+dados["hora_cos"] = np.cos(2 * np.pi * dados["hora"] / 24)
+
+dados["dia_sin"] = np.sin(2 * np.pi * dados["dia_ano"] / 365.25)
+dados["dia_cos"] = np.cos(2 * np.pi * dados["dia_ano"] / 365.25)
+
+dados["eh_dia"] = ((dados["hora"] >= 6) & (dados["hora"] <= 18)).astype(int)
+
+base = dados[
+    [
+        "rad",
+        "temp",
+        "umid",
+        "vento",
+        "hora_sin",
+        "hora_cos",
+        "dia_sin",
+        "dia_cos",
+        "eh_dia"
+    ]
+].copy()
+
+base = base.dropna()
+
+heatmap_corr(base)
+
+
+# =========================
+# BASE DO MLP COM LAGS
+# =========================
+
+base_mlp = adicionar_lags_rad(base, lags=(1, 2, 3))
+
+ENTRADAS_MLP = ENTRADAS + [
+    "rad_lag1",
+    "rad_lag2",
+    "rad_lag3"
+]
+
+
+# =========================
+# DIVISÃO TEMPORAL GERAL
+# =========================
+
+dfm = base[ENTRADAS + ["rad"]].dropna()
+
+train_full, test = split_temporal(dfm, FRAC_TREINO_TESTE)
+train, val = split_temporal(train_full, FRAC_TREINO_VALIDACAO)
+
+Xtr, ytr = train[ENTRADAS], train["rad"]
+Xval, yval = val[ENTRADAS], val["rad"]
+Xte, yte = test[ENTRADAS], test["rad"]
+
+print(f"\nTamanhos base geral -> Treino={len(train)} | Val={len(val)} | Teste={len(test)}")
+
+
+# =========================
+# DIVISÃO TEMPORAL DO MLP ALINHADA À BASE GERAL
+# =========================
+
+train_mlp = base_mlp.loc[base_mlp.index.intersection(train.index)]
+val_mlp = base_mlp.loc[base_mlp.index.intersection(val.index)]
+train_full_mlp = base_mlp.loc[base_mlp.index.intersection(train_full.index)]
+test_mlp = base_mlp.loc[base_mlp.index.intersection(test.index)]
+
+print(
+    f"Tamanhos base MLP   -> Treino={len(train_mlp)} | "
+    f"Val={len(val_mlp)} | Teste={len(test_mlp)}"
+)
+
+
+# =========================
+# MODELOS NO TESTE
+# =========================
+
+# Random Forest
+pred_rf_te = prever_rf(
+    train_full[ENTRADAS],
+    train_full["rad"],
+    Xte
+)
+
+pred_rf_te = aplicar_zero_noite(pred_rf_te, Xte.index.hour)
+
+pred_rf_te = pd.Series(
+    pred_rf_te,
+    index=Xte.index,
+    name="Random Forest"
+)
+
+
+# MLP calibrado
+pred_mlp_te = prever_mlp_calibrado(
+    train_full_mlp[ENTRADAS_MLP],
+    train_full_mlp["rad"],
+    test_mlp[ENTRADAS_MLP]
+)
+
+pred_mlp_te = aplicar_zero_noite(pred_mlp_te, test_mlp.index.hour)
+
+pred_mlp_te = pd.Series(
+    pred_mlp_te,
+    index=test_mlp.index,
+    name="MLP calibrado"
+)
+
+
+# LSTM e híbrido
+pred_lstm_te = None
+pred_h_te = None
+w_best = None
+
+try:
+    # MLP na validação
+    pred_mlp_val = prever_mlp_calibrado(
+        train_mlp[ENTRADAS_MLP],
+        train_mlp["rad"],
+        val_mlp[ENTRADAS_MLP]
+    )
+
+    pred_mlp_val = aplicar_zero_noite(pred_mlp_val, val_mlp.index.hour)
+
+    pred_mlp_val = pd.Series(
+        pred_mlp_val,
+        index=val_mlp.index,
+        name="MLP validação"
+    )
+
+    # LSTM na validação
+    pred_lstm_val = prever_lstm(
+        Xtr,
+        ytr,
+        Xval,
+        JANELA,
+        epochs=30
+    )
+
+    pred_lstm_val = pd.Series(
+        aplicar_zero_noite(pred_lstm_val.values, pred_lstm_val.index.hour),
+        index=pred_lstm_val.index,
+        name="LSTM validação"
+    )
+
+    # Otimização real do peso do híbrido
+    w_best, rmse_val, mae_val, r2_val = encontrar_melhor_peso_hibrido(
+        yval,
+        pred_lstm_val,
+        pred_mlp_val
+    )
+
+    print(
+        f"\nPeso ótimo na validação: "
+        f"wLSTM={w_best:.2f} | "
+        f"RMSE_val={rmse_val:.2f} | "
+        f"MAE_val={mae_val:.2f} | "
+        f"R²_val={r2_val:.3f}"
+    )
+
+    # LSTM no teste
+    pred_lstm_te = prever_lstm(
+        train_full[ENTRADAS],
+        train_full["rad"],
+        test[ENTRADAS],
+        JANELA,
+        epochs=50
+    )
+
+    pred_lstm_te = pd.Series(
+        aplicar_zero_noite(pred_lstm_te.values, pred_lstm_te.index.hour),
+        index=pred_lstm_te.index,
+        name="LSTM"
+    )
+
+    # Híbrido no teste
+    idx_comum_teste = (
+        yte.index
+        .intersection(pred_lstm_te.index)
+        .intersection(pred_mlp_te.index)
+    )
+
+    if len(idx_comum_teste) == 0:
+        raise ValueError("Não há índice comum no teste para montar o híbrido.")
+
+    pred_h_te = (
+        w_best * pred_lstm_te.loc[idx_comum_teste]
+        + (1 - w_best) * pred_mlp_te.loc[idx_comum_teste]
+    )
+
+    pred_h_te = pd.Series(
+        aplicar_zero_noite(pred_h_te.values, pred_h_te.index.hour),
+        index=idx_comum_teste,
+        name=f"Híbrido (wLSTM={w_best:.2f})"
+    )
+
+except Exception as e:
+    print("\n[ERRO DETALHADO] LSTM/Híbrido falhou:")
+    print("Tipo do erro:", type(e).__name__)
+    print("Mensagem:", str(e))
+
+
+# =========================
+# RESULTADOS
+# =========================
+
+print("\n=== RESULTADOS NO TESTE — CADA MODELO EM SEU ÍNDICE DISPONÍVEL ===")
+
+avaliar_serie("Random Forest", yte, pred_rf_te)
+avaliar_serie("MLP calibrado", yte, pred_mlp_te)
+
+if pred_lstm_te is not None and len(pred_lstm_te) > 0:
+    avaliar_serie("LSTM", yte, pred_lstm_te)
+
+if pred_h_te is not None and len(pred_h_te) > 0:
+    avaliar_serie(pred_h_te.name, yte, pred_h_te)
+
+
+print("\n=== COMPARAÇÃO JUSTA RF x MLP NO MESMO PERÍODO ===")
+
+idx_rf_mlp = yte.index.intersection(pred_rf_te.index).intersection(pred_mlp_te.index)
+
+if len(idx_rf_mlp) > 0:
+    imprimir(
+        "Random Forest",
+        yte.loc[idx_rf_mlp],
+        pred_rf_te.loc[idx_rf_mlp]
+    )
+
+    imprimir(
+        "MLP calibrado",
+        yte.loc[idx_rf_mlp],
+        pred_mlp_te.loc[idx_rf_mlp]
+    )
+else:
+    print("RF x MLP: sem índice temporal comum.")
+
+
+if pred_lstm_te is not None and pred_h_te is not None:
+    print("\n=== COMPARAÇÃO JUSTA ENTRE TODOS OS MODELOS NO MESMO PERÍODO ===")
+
+    idx_todos = (
+        yte.index
+        .intersection(pred_rf_te.index)
+        .intersection(pred_mlp_te.index)
+        .intersection(pred_lstm_te.index)
+        .intersection(pred_h_te.index)
+    )
+
+    if len(idx_todos) > 0:
+        imprimir(
+            "Random Forest",
+            yte.loc[idx_todos],
+            pred_rf_te.loc[idx_todos]
+        )
+
+        imprimir(
+            "MLP calibrado",
+            yte.loc[idx_todos],
+            pred_mlp_te.loc[idx_todos]
+        )
+
+        imprimir(
+            "LSTM",
+            yte.loc[idx_todos],
+            pred_lstm_te.loc[idx_todos]
+        )
+
+        imprimir(
+            pred_h_te.name,
+            yte.loc[idx_todos],
+            pred_h_te.loc[idx_todos]
+        )
+    else:
+        print("Não há índice temporal comum entre todos os modelos.")
+
+
+# =========================
+# GRÁFICO TEMPORAL
+# =========================
+
+plt.figure(figsize=(12, 4))
+
+plt.plot(yte.index, yte.values, label="Real", linewidth=1.5)
+plt.plot(pred_rf_te.index, pred_rf_te.values, label="RF", alpha=0.8)
+plt.plot(pred_mlp_te.index, pred_mlp_te.values, label="MLP calibrado", alpha=0.8)
+
+if pred_lstm_te is not None and len(pred_lstm_te) > 0:
+    plt.plot(pred_lstm_te.index, pred_lstm_te.values, label="LSTM", alpha=0.8)
+
+if pred_h_te is not None and len(pred_h_te) > 0:
+    plt.plot(pred_h_te.index, pred_h_te.values, label=pred_h_te.name, alpha=0.8)
+
+plt.title("Radiação — Real vs Modelos no Teste")
+plt.xlabel("Data/Hora")
+plt.ylabel("W/m²")
+plt.legend()
+plt.tight_layout()
+
+
+# =========================
+# GRÁFICOS DE DISPERSÃO
+# =========================
+
+fig, axs = plt.subplots(2, 2, figsize=(10, 8))
+axs = axs.ravel()
+
+
+def scatter(ax, yreal, ypred, titulo):
+    yreal = np.array(yreal)
+    ypred = np.array(ypred)
+
+    ax.scatter(yreal, ypred, s=8, alpha=0.5)
+
+    mn = min(np.min(yreal), np.min(ypred))
+    mx = max(np.max(yreal), np.max(ypred))
+
+    ax.plot([mn, mx], [mn, mx])
+    ax.set_title(titulo)
+    ax.set_xlabel("Real")
+    ax.set_ylabel("Previsto")
+
+
+# RF
+idx_rf = yte.index.intersection(pred_rf_te.index)
+scatter(
+    axs[0],
+    yte.loc[idx_rf].values,
+    pred_rf_te.loc[idx_rf].values,
+    "RF"
+)
+
+# MLP
+idx_mlp = yte.index.intersection(pred_mlp_te.index)
+scatter(
+    axs[1],
+    yte.loc[idx_mlp].values,
+    pred_mlp_te.loc[idx_mlp].values,
+    "MLP calibrado"
+)
+
+# LSTM
+if pred_lstm_te is None or len(pred_lstm_te) == 0:
+    axs[2].text(0.5, 0.5, "LSTM não disponível", ha="center", va="center")
+    axs[2].set_axis_off()
+else:
+    idx_lstm = yte.index.intersection(pred_lstm_te.index)
+    scatter(
+        axs[2],
+        yte.loc[idx_lstm].values,
+        pred_lstm_te.loc[idx_lstm].values,
+        "LSTM"
+    )
+
+# Híbrido
+if pred_h_te is None or len(pred_h_te) == 0:
+    axs[3].text(0.5, 0.5, "Híbrido não disponível", ha="center", va="center")
+    axs[3].set_axis_off()
+else:
+    idx_h = yte.index.intersection(pred_h_te.index)
+    scatter(
+        axs[3],
+        yte.loc[idx_h].values,
+        pred_h_te.loc[idx_h].values,
+        pred_h_te.name
+    )
+
+plt.tight_layout()
+
+
+# =========================
+# MOSTRAR GRÁFICOS
+# =========================
+
+plt.show()
