@@ -1,0 +1,673 @@
+import warnings
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.neural_network import MLPRegressor
+from sklearn.preprocessing import MinMaxScaler, StandardScaler
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+
+import tensorflow as tf
+
+
+# ============================================================
+# CONFIGURAÇÕES
+# ============================================================
+
+ARQ_IRRADIACAO = "dados_organizados.csv"
+ARQ_POTENCIA = "potencia_horario.csv"
+
+PASTA_SAIDA = Path("resultados_potencia")
+PASTA_SAIDA.mkdir(exist_ok=True)
+
+TARGET = "potencia_media_kw"
+
+# Com 7 dias, janela 24 fica pesada e reduz muito a amostra útil.
+# Use 3 para teste inicial. Com mais dados, teste 6, 12 e 24.
+JANELA_LSTM = 3
+
+FRAC_TREINO = 0.70
+FRAC_VALIDACAO = 0.15
+# O restante fica para teste.
+
+RANDOM_STATE = 42
+
+# Como potência FV não deve ser negativa:
+CLIP_ZERO = True
+
+# Se True, remove horas com baixa completude nos dados de potência.
+# Para 7 dias, deixei False para não reduzir demais a base.
+FILTRAR_COMPLETUDE = False
+COMPLETUDE_MINIMA = 80.0
+
+
+# ============================================================
+# MÉTRICAS
+# ============================================================
+
+def metricas(y_true, y_pred):
+    """Calcula métricas principais para comparação dos modelos."""
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+
+    mse = mean_squared_error(y_true, y_pred)
+    rmse = float(np.sqrt(mse))
+    mae = float(mean_absolute_error(y_true, y_pred))
+    r2 = float(r2_score(y_true, y_pred))
+    mbe = float(np.mean(y_pred - y_true))
+
+    media_real = float(np.mean(y_true)) if len(y_true) else np.nan
+    nrmse_media = 100 * rmse / media_real if media_real != 0 else np.nan
+
+    # MAPE com proteção contra divisão por zero.
+    mask = y_true != 0
+    if mask.sum() > 0:
+        mape = float(np.mean(np.abs((y_true[mask] - y_pred[mask]) / y_true[mask])) * 100)
+    else:
+        mape = np.nan
+
+    return {
+        "n": int(len(y_true)),
+        "RMSE": rmse,
+        "MAE": mae,
+        "R2": r2,
+        "MBE": mbe,
+        "nRMSE_media_pct": nrmse_media,
+        "MAPE_pct": mape,
+    }
+
+
+def imprimir_metricas(nome, y_true, y_pred):
+    m = metricas(y_true, y_pred)
+    print(
+        f"{nome:24s} | n={m['n']:5d} | "
+        f"RMSE={m['RMSE']:8.4f} | MAE={m['MAE']:8.4f} | "
+        f"R2={m['R2']:8.4f} | MBE={m['MBE']:8.4f} | "
+        f"nRMSE%={m['nRMSE_media_pct']:8.2f}"
+    )
+    return m
+
+
+# ============================================================
+# FUNÇÕES AUXILIARES
+# ============================================================
+
+def localizar_arquivo(nome):
+    """Procura arquivo no diretório atual e, se estiver no Colab/ChatGPT, em /mnt/data."""
+    candidatos = [
+        Path(nome),
+        Path.cwd() / nome,
+        Path("/mnt/data") / nome,
+    ]
+
+    for caminho in candidatos:
+        if caminho.exists():
+            return caminho
+
+    raise FileNotFoundError(
+        f"Arquivo não encontrado: {nome}. "
+        f"Coloque-o na mesma pasta do script ou ajuste o caminho em ARQ_IRRADIACAO/ARQ_POTENCIA."
+    )
+
+
+def split_temporal(df, frac_treino=0.70, frac_validacao=0.15):
+    """Divide a base em treino, validação e teste, mantendo a ordem temporal."""
+    n = len(df)
+    fim_treino = int(n * frac_treino)
+    fim_validacao = int(n * (frac_treino + frac_validacao))
+
+    treino = df.iloc[:fim_treino].copy()
+    validacao = df.iloc[fim_treino:fim_validacao].copy()
+    teste = df.iloc[fim_validacao:].copy()
+
+    return treino, validacao, teste
+
+
+def aplicar_limites_potencia(pred):
+    """Remove previsões negativas."""
+    pred = np.asarray(pred, dtype=float).copy()
+    if CLIP_ZERO:
+        pred = np.clip(pred, 0, None)
+    return pred
+
+
+def criar_janelas(X_df, y_ser, janela):
+    """Cria janelas temporais para LSTM."""
+    Xv = X_df.values
+    yv = y_ser.values
+
+    Xseq, yseq = [], []
+    idx = []
+
+    for i in range(janela, len(Xv)):
+        Xseq.append(Xv[i - janela:i])
+        yseq.append(yv[i])
+        idx.append(X_df.index[i])
+
+    return np.array(Xseq), np.array(yseq), pd.Index(idx)
+
+
+def adicionar_lags(df, coluna, lags=(1, 2, 3)):
+    """Adiciona defasagens de uma coluna, usando apenas valores passados."""
+    out = df.copy()
+    for lag in lags:
+        out[f"{coluna}_lag{lag}"] = out[coluna].shift(lag)
+    return out
+
+
+def adicionar_medias_moveis_passadas(df, coluna, janelas=(3,)):
+    """
+    Adiciona médias móveis usando apenas passado.
+    Exemplo: rad_mm3_passada = média das 3 horas anteriores, sem incluir a hora atual.
+    """
+    out = df.copy()
+    for janela in janelas:
+        out[f"{coluna}_mm{janela}_passada"] = (
+            out[coluna].shift(1).rolling(janela, min_periods=1).mean()
+        )
+    return out
+
+
+def salvar_grafico_correlacao(base, caminho):
+    cols = ["potencia_media_kw", "rad", "temp", "umid", "vento"]
+    cols = [c for c in cols if c in base.columns]
+    corr = base[cols].corr(numeric_only=True)
+
+    plt.figure(figsize=(7, 6))
+    im = plt.imshow(corr.values, vmin=-1, vmax=1)
+    plt.colorbar(im)
+    plt.xticks(range(len(corr.columns)), corr.columns, rotation=45, ha="right")
+    plt.yticks(range(len(corr.index)), corr.index)
+    plt.title("Correlação entre potência, irradiação e meteorologia")
+
+    for i in range(corr.shape[0]):
+        for j in range(corr.shape[1]):
+            v = corr.iloc[i, j]
+            plt.text(j, i, f"{v:.2f}", ha="center", va="center")
+
+    plt.tight_layout()
+    plt.savefig(caminho, dpi=300)
+    plt.close()
+
+
+# ============================================================
+# LEITURA E JUNÇÃO DOS DADOS
+# ============================================================
+
+def carregar_e_preparar_base():
+    arq_irr = localizar_arquivo(ARQ_IRRADIACAO)
+    arq_pot = localizar_arquivo(ARQ_POTENCIA)
+
+    irradiacao = pd.read_csv(arq_irr, parse_dates=["DATETIME"])
+    potencia = pd.read_csv(arq_pot, parse_dates=["data_hora"])
+
+    irradiacao = (
+        irradiacao
+        .replace(-999, np.nan)
+        .rename(columns={
+            "DATETIME": "data_hora",
+            "ALLSKY_SFC_SW_DWN": "rad",
+            "T2M": "temp",
+            "RH2M": "umid",
+            "WS10M": "vento",
+        })
+    )
+
+    potencia = potencia.rename(columns={
+        "potencia_media_kw": "potencia_media_kw"
+    })
+
+    # Garante arredondamento horário e ordenação.
+    irradiacao["data_hora"] = pd.to_datetime(irradiacao["data_hora"]).dt.floor("h")
+    potencia["data_hora"] = pd.to_datetime(potencia["data_hora"]).dt.floor("h")
+
+    irradiacao = irradiacao.drop_duplicates("data_hora").sort_values("data_hora")
+    potencia = potencia.drop_duplicates("data_hora").sort_values("data_hora")
+
+    cols_pot = ["data_hora", "potencia_media_kw"]
+    for c in ["energia_estimada_kwh", "n_amostras", "completude_pct"]:
+        if c in potencia.columns:
+            cols_pot.append(c)
+
+    base = pd.merge(
+        irradiacao[["data_hora", "rad", "temp", "umid", "vento"]],
+        potencia[cols_pot],
+        on="data_hora",
+        how="inner",
+    )
+
+    base = base.set_index("data_hora").sort_index()
+
+    if FILTRAR_COMPLETUDE and "completude_pct" in base.columns:
+        base = base[base["completude_pct"] >= COMPLETUDE_MINIMA].copy()
+
+    # Remove linhas sem alvo ou sem irradiância.
+    base = base.dropna(subset=[TARGET, "rad"])
+
+    # Interpola meteorologia se houver pequenas falhas.
+    for c in ["temp", "umid", "vento"]:
+        if c in base.columns:
+            base[c] = base[c].interpolate("linear", limit=3)
+
+    base = base.dropna(subset=["temp", "umid", "vento"])
+
+    # Variáveis temporais.
+    base["hora"] = base.index.hour
+    base["dia_ano"] = base.index.dayofyear
+    base["mes"] = base.index.month
+
+    base["hora_sin"] = np.sin(2 * np.pi * base["hora"] / 24)
+    base["hora_cos"] = np.cos(2 * np.pi * base["hora"] / 24)
+
+    base["dia_sin"] = np.sin(2 * np.pi * base["dia_ano"] / 365.25)
+    base["dia_cos"] = np.cos(2 * np.pi * base["dia_ano"] / 365.25)
+
+    base["eh_dia"] = (base["rad"] > 0).astype(int)
+
+    # Features derivadas da irradiação prevista.
+    base = adicionar_lags(base, "rad", lags=(1, 2, 3))
+    base = adicionar_medias_moveis_passadas(base, "rad", janelas=(3,))
+
+    # Remove linhas iniciais sem lags.
+    base = base.dropna()
+
+    return base
+
+
+# ============================================================
+# MODELOS
+# ============================================================
+
+def treinar_prever_rf(Xtr, ytr, Xpred):
+    modelo = RandomForestRegressor(
+        n_estimators=500,
+        max_depth=None,
+        min_samples_leaf=1,
+        random_state=RANDOM_STATE,
+        n_jobs=-1,
+    )
+    modelo.fit(Xtr, ytr)
+    pred = modelo.predict(Xpred)
+    return aplicar_limites_potencia(pred), modelo
+
+
+def treinar_prever_mlp(Xtr, ytr, Xpred):
+    sx = StandardScaler()
+    sy = MinMaxScaler()
+
+    Xtr_s = sx.fit_transform(Xtr)
+    Xpred_s = sx.transform(Xpred)
+
+    ytr_s = sy.fit_transform(ytr.values.reshape(-1, 1)).ravel()
+
+    # Rede pequena para base pequena.
+    mlp = MLPRegressor(
+        hidden_layer_sizes=(16, 8),
+        activation="relu",
+        solver="adam",
+        alpha=0.01,
+        batch_size=min(16, max(4, len(Xtr) // 4)),
+        learning_rate_init=0.001,
+        max_iter=5000,
+        early_stopping=True,
+        validation_fraction=0.20,
+        n_iter_no_change=30,
+        random_state=RANDOM_STATE,
+    )
+
+    mlp.fit(Xtr_s, ytr_s)
+
+    pred_s = mlp.predict(Xpred_s)
+    pred = sy.inverse_transform(pred_s.reshape(-1, 1)).ravel()
+
+    return aplicar_limites_potencia(pred), mlp, sx, sy
+
+
+def treinar_prever_lstm(Xtr, ytr, Xpred, janela=3, epochs=120):
+    tf.keras.backend.clear_session()
+    tf.random.set_seed(RANDOM_STATE)
+    np.random.seed(RANDOM_STATE)
+
+    sx = MinMaxScaler()
+    sy = MinMaxScaler()
+
+    Xtr_s = pd.DataFrame(
+        sx.fit_transform(Xtr),
+        index=Xtr.index,
+        columns=Xtr.columns,
+    )
+
+    ytr_s = pd.Series(
+        sy.fit_transform(ytr.values.reshape(-1, 1)).ravel(),
+        index=ytr.index,
+    )
+
+    Xtr_seq, ytr_seq, _ = criar_janelas(Xtr_s, ytr_s, janela)
+
+    if len(Xtr_seq) < 5:
+        raise ValueError(
+            f"Treino insuficiente para LSTM. "
+            f"Foram criadas apenas {len(Xtr_seq)} janelas."
+        )
+
+    n_features = Xtr_seq.shape[2]
+
+    model = tf.keras.Sequential([
+        tf.keras.layers.Input(shape=(janela, n_features)),
+        tf.keras.layers.LSTM(32, activation="tanh", return_sequences=False),
+        tf.keras.layers.Dropout(0.20),
+        tf.keras.layers.Dense(16, activation="relu"),
+        tf.keras.layers.Dense(1),
+    ])
+
+    model.compile(
+        optimizer=tf.keras.optimizers.Adam(learning_rate=0.001),
+        loss="mse",
+    )
+
+    es = tf.keras.callbacks.EarlyStopping(
+        monitor="val_loss",
+        patience=15,
+        restore_best_weights=True,
+    )
+
+    # validation_split só funciona bem com dados suficientes.
+    validation_split = 0.2 if len(Xtr_seq) >= 20 else 0.0
+    callbacks = [es] if validation_split > 0 else []
+
+    model.fit(
+        Xtr_seq,
+        ytr_seq,
+        epochs=epochs,
+        batch_size=min(16, max(4, len(Xtr_seq) // 4)),
+        verbose=0,
+        validation_split=validation_split,
+        callbacks=callbacks,
+        shuffle=False,
+    )
+
+    # Para prever o período seguinte, usa o fim do treino como contexto inicial.
+    X_contexto = pd.concat([Xtr.iloc[-janela:], Xpred], axis=0)
+
+    X_contexto_s = pd.DataFrame(
+        sx.transform(X_contexto),
+        index=X_contexto.index,
+        columns=X_contexto.columns,
+    )
+
+    y_dummy = pd.Series(np.zeros(len(X_contexto_s)), index=X_contexto_s.index)
+    Xseq_pred, _, idx_pred = criar_janelas(X_contexto_s, y_dummy, janela)
+
+    pred_s = model.predict(Xseq_pred, verbose=0).ravel()
+    pred = sy.inverse_transform(pred_s.reshape(-1, 1)).ravel()
+    pred = aplicar_limites_potencia(pred)
+
+    return pd.Series(pred, index=idx_pred), model, sx, sy
+
+
+def melhor_peso_hibrido(y_real, pred_lstm, pred_mlp):
+    """
+    Híbrido:
+        pred_h = w * LSTM + (1 - w) * MLP
+
+    O peso é escolhido na validação pelo menor RMSE.
+    """
+    idx = y_real.index.intersection(pred_lstm.index).intersection(pred_mlp.index)
+
+    if len(idx) == 0:
+        raise ValueError("Sem índice comum para calcular o peso do híbrido.")
+
+    y = y_real.loc[idx]
+    lstm = pred_lstm.loc[idx]
+    mlp = pred_mlp.loc[idx]
+
+    melhor = {
+        "w": None,
+        "rmse": np.inf,
+        "mae": None,
+        "r2": None,
+    }
+
+    for w in np.linspace(0, 1, 101):
+        pred = w * lstm + (1 - w) * mlp
+        m = metricas(y, pred)
+        if m["RMSE"] < melhor["rmse"]:
+            melhor = {
+                "w": float(w),
+                "rmse": m["RMSE"],
+                "mae": m["MAE"],
+                "r2": m["R2"],
+            }
+
+    return melhor
+
+
+# ============================================================
+# EXECUÇÃO PRINCIPAL
+# ============================================================
+
+def main():
+    base = carregar_e_preparar_base()
+    base.to_csv(PASTA_SAIDA / "base_irradiancia_potencia_horaria.csv", encoding="utf-8-sig")
+
+    print("\n=== BASE FINAL IRRADIAÇÃO + POTÊNCIA ===")
+    print(f"Linhas: {len(base)}")
+    print(f"Início: {base.index.min()}")
+    print(f"Fim:    {base.index.max()}")
+
+    if len(base) < 120:
+        warnings.warn(
+            "A base tem poucas amostras para LSTM. "
+            "Os resultados são úteis para teste do fluxo, mas não para conclusão robusta."
+        )
+
+    salvar_grafico_correlacao(base, PASTA_SAIDA / "grafico_correlacao.png")
+
+    features = [
+        "rad",
+        "temp",
+        "umid",
+        "vento",
+        "hora_sin",
+        "hora_cos",
+        "dia_sin",
+        "dia_cos",
+        "eh_dia",
+        "rad_lag1",
+        "rad_lag2",
+        "rad_lag3",
+        "rad_mm3_passada",
+    ]
+
+    dfm = base[features + [TARGET]].dropna().copy()
+
+    treino, validacao, teste = split_temporal(
+        dfm,
+        frac_treino=FRAC_TREINO,
+        frac_validacao=FRAC_VALIDACAO,
+    )
+
+    print("\n=== DIVISÃO TEMPORAL ===")
+    print(f"Treino:    {len(treino):4d} | {treino.index.min()} até {treino.index.max()}")
+    print(f"Validação: {len(validacao):4d} | {validacao.index.min()} até {validacao.index.max()}")
+    print(f"Teste:     {len(teste):4d} | {teste.index.min()} até {teste.index.max()}")
+
+    if len(validacao) == 0 or len(teste) == 0:
+        raise ValueError("Validação ou teste ficaram vazios. Aumente a base de dados.")
+
+    Xtr, ytr = treino[features], treino[TARGET]
+    Xval, yval = validacao[features], validacao[TARGET]
+    Xte, yte = teste[features], teste[TARGET]
+
+    train_full = pd.concat([treino, validacao], axis=0)
+    Xtrain_full, ytrain_full = train_full[features], train_full[TARGET]
+
+    # --------------------------
+    # Validação: MLP e LSTM para escolher peso do híbrido
+    # --------------------------
+    pred_mlp_val_arr, *_ = treinar_prever_mlp(Xtr, ytr, Xval)
+    pred_mlp_val = pd.Series(pred_mlp_val_arr, index=Xval.index, name="MLP_validacao")
+
+    pred_lstm_val, *_ = treinar_prever_lstm(
+        Xtr, ytr, Xval,
+        janela=JANELA_LSTM,
+        epochs=150,
+    )
+    pred_lstm_val.name = "LSTM_validacao"
+
+    peso = melhor_peso_hibrido(yval, pred_lstm_val, pred_mlp_val)
+
+    print("\n=== PESO DO HÍBRIDO ESCOLHIDO NA VALIDAÇÃO ===")
+    print(
+        f"w_LSTM={peso['w']:.2f} | "
+        f"w_MLP={1 - peso['w']:.2f} | "
+        f"RMSE_val={peso['rmse']:.4f} | "
+        f"MAE_val={peso['mae']:.4f} | "
+        f"R2_val={peso['r2']:.4f}"
+    )
+
+    # --------------------------
+    # Teste final: treina em treino+validação e testa no teste
+    # --------------------------
+    pred_rf_arr, modelo_rf = treinar_prever_rf(Xtrain_full, ytrain_full, Xte)
+    pred_rf = pd.Series(pred_rf_arr, index=Xte.index, name="Random Forest")
+
+    pred_mlp_arr, modelo_mlp, sx_mlp, sy_mlp = treinar_prever_mlp(Xtrain_full, ytrain_full, Xte)
+    pred_mlp = pd.Series(pred_mlp_arr, index=Xte.index, name="MLP")
+
+    pred_lstm, modelo_lstm, sx_lstm, sy_lstm = treinar_prever_lstm(
+        Xtrain_full, ytrain_full, Xte,
+        janela=JANELA_LSTM,
+        epochs=150,
+    )
+    pred_lstm.name = "LSTM"
+
+    idx_h = yte.index.intersection(pred_lstm.index).intersection(pred_mlp.index)
+    pred_hibrido = (
+        peso["w"] * pred_lstm.loc[idx_h]
+        + (1 - peso["w"]) * pred_mlp.loc[idx_h]
+    )
+    pred_hibrido = pd.Series(
+        aplicar_limites_potencia(pred_hibrido.values),
+        index=idx_h,
+        name=f"Híbrido LSTM+MLP (w={peso['w']:.2f})",
+    )
+
+    # --------------------------
+    # Métricas
+    # --------------------------
+    print("\n=== RESULTADOS NO TESTE — CADA MODELO NO SEU ÍNDICE DISPONÍVEL ===")
+    resultados = []
+
+    for nome, pred in [
+        ("Random Forest", pred_rf),
+        ("MLP", pred_mlp),
+        ("LSTM", pred_lstm),
+        (pred_hibrido.name, pred_hibrido),
+    ]:
+        idx = yte.index.intersection(pred.index)
+        m = imprimir_metricas(nome, yte.loc[idx], pred.loc[idx])
+        m["modelo"] = nome
+        resultados.append(m)
+
+    print("\n=== COMPARAÇÃO JUSTA: TODOS NO MESMO PERÍODO ===")
+    idx_todos = (
+        yte.index
+        .intersection(pred_rf.index)
+        .intersection(pred_mlp.index)
+        .intersection(pred_lstm.index)
+        .intersection(pred_hibrido.index)
+    )
+
+    resultados_justos = []
+    for nome, pred in [
+        ("Random Forest", pred_rf),
+        ("MLP", pred_mlp),
+        ("LSTM", pred_lstm),
+        (pred_hibrido.name, pred_hibrido),
+    ]:
+        m = imprimir_metricas(nome, yte.loc[idx_todos], pred.loc[idx_todos])
+        m["modelo"] = nome
+        m["comparacao"] = "mesmo_periodo"
+        resultados_justos.append(m)
+
+    metricas_df = pd.DataFrame(resultados_justos)
+    cols = ["modelo", "comparacao", "n", "RMSE", "MAE", "R2", "MBE", "nRMSE_media_pct", "MAPE_pct"]
+    metricas_df = metricas_df[cols]
+    metricas_df.to_csv(PASTA_SAIDA / "metricas_potencia_modelos.csv", index=False, encoding="utf-8-sig")
+
+    # --------------------------
+    # Salva previsões
+    # --------------------------
+    previsoes = pd.DataFrame(index=idx_todos)
+    previsoes["potencia_real_kw"] = yte.loc[idx_todos]
+    previsoes["RF_kw"] = pred_rf.loc[idx_todos]
+    previsoes["MLP_kw"] = pred_mlp.loc[idx_todos]
+    previsoes["LSTM_kw"] = pred_lstm.loc[idx_todos]
+    previsoes["Hibrido_LSTM_MLP_kw"] = pred_hibrido.loc[idx_todos]
+    previsoes["rad_prevista"] = base.loc[idx_todos, "rad"]
+    previsoes["temp"] = base.loc[idx_todos, "temp"]
+    previsoes["umid"] = base.loc[idx_todos, "umid"]
+    previsoes["vento"] = base.loc[idx_todos, "vento"]
+
+    previsoes.to_csv(PASTA_SAIDA / "previsoes_potencia_modelos.csv", encoding="utf-8-sig")
+
+    # --------------------------
+    # Gráfico temporal
+    # --------------------------
+    plt.figure(figsize=(13, 5))
+    plt.plot(previsoes.index, previsoes["potencia_real_kw"], label="Real", linewidth=2)
+    plt.plot(previsoes.index, previsoes["RF_kw"], label="RF", alpha=0.85)
+    plt.plot(previsoes.index, previsoes["MLP_kw"], label="MLP", alpha=0.85)
+    plt.plot(previsoes.index, previsoes["LSTM_kw"], label="LSTM", alpha=0.85)
+    plt.plot(previsoes.index, previsoes["Hibrido_LSTM_MLP_kw"], label="Híbrido LSTM+MLP", alpha=0.85)
+    plt.title("Potência horária — Real vs modelos")
+    plt.xlabel("Data/Hora")
+    plt.ylabel("Potência média horária (kW)")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(PASTA_SAIDA / "grafico_potencia_real_vs_modelos.png", dpi=300)
+    plt.close()
+
+    # --------------------------
+    # Gráficos de dispersão
+    # --------------------------
+    fig, axs = plt.subplots(2, 2, figsize=(10, 8))
+    axs = axs.ravel()
+
+    pares = [
+        ("RF_kw", "RF"),
+        ("MLP_kw", "MLP"),
+        ("LSTM_kw", "LSTM"),
+        ("Hibrido_LSTM_MLP_kw", "Híbrido LSTM+MLP"),
+    ]
+
+    real = previsoes["potencia_real_kw"].values
+    minimo = min(real.min(), previsoes[[p[0] for p in pares]].min().min())
+    maximo = max(real.max(), previsoes[[p[0] for p in pares]].max().max())
+
+    for ax, (col, titulo) in zip(axs, pares):
+        ax.scatter(previsoes["potencia_real_kw"], previsoes[col], s=20, alpha=0.7)
+        ax.plot([minimo, maximo], [minimo, maximo])
+        ax.set_title(titulo)
+        ax.set_xlabel("Potência real (kW)")
+        ax.set_ylabel("Potência prevista (kW)")
+
+    plt.tight_layout()
+    plt.savefig(PASTA_SAIDA / "grafico_dispersao_potencia.png", dpi=300)
+    plt.close()
+
+    print("\n=== ARQUIVOS GERADOS ===")
+    print(PASTA_SAIDA / "base_irradiancia_potencia_horaria.csv")
+    print(PASTA_SAIDA / "previsoes_potencia_modelos.csv")
+    print(PASTA_SAIDA / "metricas_potencia_modelos.csv")
+    print(PASTA_SAIDA / "grafico_potencia_real_vs_modelos.png")
+    print(PASTA_SAIDA / "grafico_dispersao_potencia.png")
+    print(PASTA_SAIDA / "grafico_correlacao.png")
+
+
+if __name__ == "__main__":
+    main()
