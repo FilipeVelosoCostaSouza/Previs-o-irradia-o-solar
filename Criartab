@@ -1,0 +1,47 @@
+import pandas as pd
+from pathlib import Path
+import matplotlib.pyplot as plt
+
+# Caminho do arquivo CSV
+csv_path = Path(r"C:\Users\filip\OneDrive\Área de Trabalho\ler_nasa\POWER_Point_Hourly_20250801_20250831_007d14S_034d85W_LST.csv")
+
+# Encontra a linha de cabeçalho
+for i, line in enumerate(open(csv_path, encoding="utf-8", errors="replace")):
+    if line.startswith("YEAR,MO,DY,HR"):
+        header_row = i
+        break
+
+# Lê o CSV e cria a coluna de data
+df = pd.read_csv(csv_path, skiprows=header_row)
+df["DATETIME"] = pd.to_datetime(df[["YEAR", "MO", "DY", "HR"]].rename(columns={"YEAR": "year", "MO": "month", "DY": "day", "HR": "hour"}), errors="coerce")
+
+# Salva novo CSV
+df[["DATETIME", "ALLSKY_SFC_SW_DWN", "T2M", "RH2M", "WS10M"]].to_csv(csv_path.with_name("dados_organizados.csv"), index=False)
+print("Arquivo salvo!")
+
+plt.ion()
+
+# Definição das variáveis para plotagem
+vars_info = {
+    "T2M": ("Temperatura a 2 m", "°C"),
+    "RH2M": ("Umidade a 2 m", "%"),
+    "WS10M": ("Vento a 10 m", "m/s"),
+    "ALLSKY_SFC_SW_DWN": ("Radiação na superfície", "W/m²"),
+}
+
+def plotar_graficos(df, vars_info):
+    for col, (title, unit) in vars_info.items():
+        plt.figure(figsize=(10, 6))
+        plt.plot(df['DATETIME'], df[col])  # Plota usando a coluna 'DATETIME'
+        plt.title(f"{title} — Série horária")
+        plt.xlabel("Data/Hora")
+        plt.ylabel(unit)
+        plt.grid(True)
+        plt.xticks(rotation=45)
+        plt.tight_layout()
+        plt.savefig(f"serie_horaria_{col}.png")  # Salva o gráfico
+        plt.show()  # Exibe o gráfico
+
+# Executa a plotagem
+plotar_graficos(df, vars_info)
+print("Gráficos de série horária gerados e plotados!")
