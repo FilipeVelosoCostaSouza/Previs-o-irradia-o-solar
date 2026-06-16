@@ -27,7 +27,7 @@ TARGET = "potencia_media_kw"
 
 # Com 7 dias, janela 24 fica pesada e reduz muito a amostra útil.
 # Use 3 para teste inicial. Com mais dados, teste 6, 12 e 24.
-JANELA_LSTM = 3
+JANELA_LSTM = 12
 
 FRAC_TREINO = 0.70
 FRAC_VALIDACAO = 0.15
@@ -126,11 +126,20 @@ def split_temporal(df, frac_treino=0.70, frac_validacao=0.15):
     return treino, validacao, teste
 
 
-def aplicar_limites_potencia(pred):
-    """Remove previsões negativas."""
+def aplicar_limites_potencia(pred, rad=None):
+    """
+    Remove previsões negativas e zera a potência prevista quando não há irradiação.
+    Isso anula o turno da noite.
+    """
     pred = np.asarray(pred, dtype=float).copy()
+
     if CLIP_ZERO:
         pred = np.clip(pred, 0, None)
+
+    if rad is not None:
+        rad = np.asarray(rad, dtype=float)
+        pred[rad <= 0] = 0
+
     return pred
 
 
@@ -268,7 +277,7 @@ def carregar_e_preparar_base():
     base["eh_dia"] = (base["rad"] > 0).astype(int)
 
     # Features derivadas da irradiação prevista.
-    base = adicionar_lags(base, "rad", lags=(1, 2, 3))
+    base = adicionar_lags(base, "rad", lags=(1, 2, 3, 4, 5, 6))
     base = adicionar_medias_moveis_passadas(base, "rad", janelas=(3,))
 
     # Remove linhas iniciais sem lags.
@@ -291,7 +300,7 @@ def treinar_prever_rf(Xtr, ytr, Xpred):
     )
     modelo.fit(Xtr, ytr)
     pred = modelo.predict(Xpred)
-    return aplicar_limites_potencia(pred), modelo
+    return aplicar_limites_potencia(pred, rad=Xpred["rad"].values), modelo
 
 
 def treinar_prever_mlp(Xtr, ytr, Xpred):
@@ -323,7 +332,7 @@ def treinar_prever_mlp(Xtr, ytr, Xpred):
     pred_s = mlp.predict(Xpred_s)
     pred = sy.inverse_transform(pred_s.reshape(-1, 1)).ravel()
 
-    return aplicar_limites_potencia(pred), mlp, sx, sy
+    return aplicar_limites_potencia(pred, rad=Xpred["rad"].values), mlp, sx, sy
 
 
 def treinar_prever_lstm(Xtr, ytr, Xpred, janela=3, epochs=120):
@@ -403,7 +412,8 @@ def treinar_prever_lstm(Xtr, ytr, Xpred, janela=3, epochs=120):
 
     pred_s = model.predict(Xseq_pred, verbose=0).ravel()
     pred = sy.inverse_transform(pred_s.reshape(-1, 1)).ravel()
-    pred = aplicar_limites_potencia(pred)
+    rad_pred = X_contexto.loc[idx_pred, "rad"].values
+    pred = aplicar_limites_potencia(pred, rad=rad_pred)
 
     return pd.Series(pred, index=idx_pred), model, sx, sy
 
@@ -479,6 +489,9 @@ def main():
         "rad_lag1",
         "rad_lag2",
         "rad_lag3",
+        "rad_lag4",
+        "rad_lag5",
+        "rad_lag6",
         "rad_mm3_passada",
     ]
 
@@ -551,7 +564,10 @@ def main():
         + (1 - peso["w"]) * pred_mlp.loc[idx_h]
     )
     pred_hibrido = pd.Series(
-        aplicar_limites_potencia(pred_hibrido.values),
+        aplicar_limites_potencia(
+            pred_hibrido.values,
+            rad=base.loc[idx_h, "rad"].values
+        ),
         index=idx_h,
         name=f"Híbrido LSTM+MLP (w={peso['w']:.2f})",
     )
