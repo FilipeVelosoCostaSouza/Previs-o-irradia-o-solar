@@ -1,0 +1,118 @@
+import pandas as pd
+from pathlib import Path
+
+# Pasta onde estão os 31 CSVs e este script
+PASTA = Path(__file__).parent
+
+# Ele pega automaticamente todos os CSVs do equipamento
+ARQUIVOS = sorted(PASTA.glob("DEVICE_HISTORY_ROW_*.csv"))
+
+INICIO = "2025-08-01 00:00:00"
+FIM = "2025-08-31 23:59:59"
+
+def ler_arquivo_em_linha(caminho):
+    df = pd.read_csv(caminho)
+
+    if df.empty:
+        print("Arquivo vazio:", caminho.name)
+        return pd.DataFrame(columns=["data_hora", "potencia_kw", "arquivo_origem"])
+
+    linha = df.iloc[0]
+
+    datas = pd.to_datetime(
+        list(df.columns[1:]),
+        errors="coerce",
+        format="mixed"
+    )
+
+    valores = pd.to_numeric(linha.iloc[1:], errors="coerce")
+
+    saida = pd.DataFrame({
+        "data_hora": datas,
+        "potencia_kw": valores.values,
+        "arquivo_origem": caminho.name
+    })
+
+    saida = saida.dropna(subset=["data_hora", "potencia_kw"])
+    return saida
+
+
+bases = []
+
+print("\n=== LENDO ARQUIVOS CSV ===")
+
+for arq in ARQUIVOS:
+    try:
+        base = ler_arquivo_em_linha(arq)
+
+        base_mes = base[
+            (base["data_hora"] >= pd.Timestamp(INICIO)) &
+            (base["data_hora"] <= pd.Timestamp(FIM))
+        ].copy()
+
+        if not base_mes.empty:
+            bases.append(base_mes)
+            print("Incluído:", arq.name, "| linhas:", len(base_mes))
+        else:
+            print("Ignorado, fora de agosto:", arq.name)
+
+    except Exception as e:
+        print("Erro ao ler:", arq.name, "|", e)
+
+
+if not bases:
+    raise ValueError("Nenhum dado de agosto de 2025 foi encontrado nos CSVs.")
+
+base_2min = (
+    pd.concat(bases, ignore_index=True)
+      .drop_duplicates(subset=["data_hora"], keep="first")
+      .sort_values("data_hora")
+      .reset_index(drop=True)
+)
+
+base_2min["data"] = base_2min["data_hora"].dt.date.astype(str)
+base_2min["hora"] = base_2min["data_hora"].dt.strftime("%H:%M")
+base_2min = base_2min[["data_hora", "data", "hora", "potencia_kw", "arquivo_origem"]]
+
+horario = (
+    base_2min.set_index("data_hora")
+    .resample("1h")
+    .agg(
+        potencia_media_kw=("potencia_kw", "mean"),
+        potencia_max_kw=("potencia_kw", "max"),
+        potencia_min_kw=("potencia_kw", "min"),
+        n_amostras=("potencia_kw", "count")
+    )
+    .reset_index()
+)
+
+horario = horario[horario["n_amostras"] > 0].copy()
+horario["completude_pct"] = (horario["n_amostras"] / 30 * 100).round(1)
+horario["energia_estimada_kwh"] = horario["potencia_media_kw"]
+horario["data"] = horario["data_hora"].dt.date.astype(str)
+horario["hora"] = horario["data_hora"].dt.strftime("%H:%M")
+
+horario = horario[[
+    "data_hora", "data", "hora",
+    "potencia_media_kw", "energia_estimada_kwh",
+    "potencia_min_kw", "potencia_max_kw",
+    "n_amostras", "completude_pct"
+]]
+
+# Salva por cima dos arquivos já existentes
+base_2min.to_csv(PASTA / "potencia_2min_unificado.csv", index=False, encoding="utf-8-sig")
+horario.to_csv(PASTA / "potencia_horario.csv", index=False, encoding="utf-8-sig")
+
+print("\n=== ARQUIVOS GERADOS / SOBRESCRITOS ===")
+print("potencia_2min_unificado.csv")
+print("potencia_horario.csv")
+
+print("\n=== RESUMO ===")
+print("Arquivos CSV encontrados:", len(ARQUIVOS))
+print("Arquivos incluídos:", len(bases))
+print("Registros de 2 min:", len(base_2min))
+print("Registros horários:", len(horario))
+print("Período:", base_2min["data_hora"].min(), "até", base_2min["data_hora"].max())
+
+print("\n=== DIAS PRESENTES ===")
+print(base_2min["data"].drop_duplicates().to_string(index=False))
